@@ -5,29 +5,51 @@ from urllib.parse import urlparse
 from workers import WorkerEntrypoint, Response
 
 
-MODEL_KEY = "pia_online_kmeans_v1"
+# New model key so this version starts from clean centroids instead of reusing
+# centroids that may have moved during earlier manual testing.
+MODEL_KEY = "pia_online_kmeans_v2_human_reactions"
 
+# These are normalized "performance strength" dimensions.
 FEATURES = [
-    "recent_accuracy",
-    "average_attempts",
-    "hint_rate",
-    "average_response_time",
-    "consecutive_correct",
-    "consecutive_wrong",
+    "accuracy_strength",
+    "attempt_strength",
+    "independence_strength",
+    "correct_efficiency_strength",
+    "correct_streak_strength",
+    "wrong_streak_control",
 ]
 
+# Accuracy and wrong streak are deliberately more influential than speed.
+# Speed is only a bonus for correct responses.
+FEATURE_WEIGHTS = [
+    3.00,  # accuracy
+    1.50,  # attempts needed
+    1.00,  # independence from hints, only rewarded with accuracy
+    0.75,  # speed/efficiency on correct answers only
+    1.50,  # correct streak
+    2.25,  # control of wrong streak
+]
 
-# Cold-start cluster centers.
-# These only give the model a sensible starting point.
-# As students use the system, the centroids update dynamically.
+# Cold-start centers for the three clusters.
+# These are starting prototypes; they are NOT student labels.
+# If online learning is enabled later, the centroids can update incrementally.
 DEFAULT_MODEL = {
     "centroids": [
-        [0.25, 0.30, 0.25, 0.30, 0.15, 0.25],
-        [0.58, 0.60, 0.58, 0.60, 0.50, 0.60],
-        [0.88, 0.88, 0.90, 0.86, 0.90, 0.90]
+        # Struggling-like performance pattern
+        [0.20, 0.35, 0.10, 0.20, 0.10, 0.25],
+
+        # Average-like performance pattern
+        [0.60, 0.65, 0.40, 0.55, 0.45, 0.70],
+
+        # Outstanding-like performance pattern
+        [0.90, 0.90, 0.85, 0.85, 0.90, 0.95],
     ],
-    "counts": [1, 1, 1],
-    "updates": 0
+
+    # Start with a little inertia so accidental test traffic does not move a
+    # centroid too aggressively if learning is enabled later.
+    "counts": [12, 12, 12],
+    "updates": 0,
+    "version": 2,
 }
 
 
@@ -44,57 +66,80 @@ def as_float(data, key, default=0.0):
 
 def feature_vector(data):
     accuracy = clamp(
-        as_float(data, "recent_accuracy")
+        as_float(data, "recent_accuracy", 0.5)
     )
 
-    attempts = clamp(
-        (as_float(data, "average_attempts", 1.0) - 1.0) / 4.0
+    # 1 attempt is strongest. 5+ attempts reaches the bottom of this feature.
+    average_attempts = max(
+        1.0,
+        as_float(data, "average_attempts", 1.0)
+    )
+    attempt_strength = 1.0 - clamp(
+        (average_attempts - 1.0) / 4.0
     )
 
-    hints = clamp(
-        as_float(data, "hint_rate")
+    hint_rate = clamp(
+        as_float(data, "hint_rate", 0.0)
     )
 
-    response_time = clamp(
-        as_float(data, "average_response_time") / 120.0
+    # IMPORTANT:
+    # "No hint" should not look impressive when the learner is mostly wrong.
+    # Independence therefore only becomes strong when it is paired with
+    # demonstrated correctness.
+    independence_strength = accuracy * (1.0 - hint_rate)
+
+    # Frontend v2 sends an efficiency score calculated ONLY from correct
+    # responses. If an older frontend calls this worker, derive a fallback
+    # from response time but only when some answers are correct.
+    if "correct_response_efficiency" in data:
+        correct_efficiency = clamp(
+            as_float(data, "correct_response_efficiency", 0.0)
+        )
+    else:
+        average_response_time = max(
+            0.0,
+            as_float(data, "average_response_time", 120.0)
+        )
+        correct_efficiency = (
+            1.0 / (1.0 + average_response_time / 30.0)
+            if accuracy > 0
+            else 0.0
+        )
+
+    correct_streak_strength = clamp(
+        as_float(data, "consecutive_correct", 0.0) / 5.0
     )
 
-    correct_streak = clamp(
-        as_float(data, "consecutive_correct") / 5.0
+    wrong_streak_control = 1.0 - clamp(
+        as_float(data, "consecutive_wrong", 0.0) / 5.0
     )
 
-    wrong_streak = clamp(
-        as_float(data, "consecutive_wrong") / 5.0
-    )
-
-    # Every dimension is transformed so:
-    #
-    # higher number = stronger current performance
-    #
-    # This makes the cluster meanings easier to interpret.
     return [
         accuracy,
-        1.0 - attempts,
-        1.0 - hints,
-        1.0 - response_time,
-        correct_streak,
-        1.0 - wrong_streak
+        attempt_strength,
+        independence_strength,
+        correct_efficiency,
+        correct_streak_strength,
+        wrong_streak_control,
     ]
 
 
-def distance(a, b):
-    return math.sqrt(
-        sum(
-            (x - y) ** 2
-            for x, y in zip(a, b)
-        )
-    )
+def weighted_distance(a, b):
+    total = 0.0
+
+    for value, center, weight in zip(
+        a,
+        b,
+        FEATURE_WEIGHTS
+    ):
+        total += weight * ((value - center) ** 2)
+
+    return math.sqrt(total)
 
 
 def nearest_cluster(vector, centroids):
-
     distances = [
-        distance(vector, centroid)
+        weighted_distance(vector, centroid)
         for centroid in centroids
     ]
 
@@ -107,8 +152,7 @@ def nearest_cluster(vector, centroids):
 
     if len(ordered) > 1 and ordered[1] > 0:
         confidence = clamp(
-            (ordered[1] - ordered[0])
-            / ordered[1]
+            (ordered[1] - ordered[0]) / ordered[1]
         )
     else:
         confidence = 1.0
@@ -116,53 +160,54 @@ def nearest_cluster(vector, centroids):
     return cluster, distances, confidence
 
 
-def profile_map(centroids):
+def weighted_performance_score(vector):
+    numerator = sum(
+        value * weight
+        for value, weight in zip(vector, FEATURE_WEIGHTS)
+    )
 
-    # Cluster numbers themselves have no meaning.
-    #
-    # Therefore we order the learned clusters
-    # from lowest-performing to highest-performing.
+    denominator = sum(FEATURE_WEIGHTS)
+
+    return numerator / denominator
+
+
+def profile_map(centroids):
+    # K-Means cluster numbers themselves have no semantic meaning.
+    # Order the learned centers from weakest performance pattern to strongest.
     ranked = sorted(
         range(len(centroids)),
-        key=lambda i:
-            sum(centroids[i])
-            / len(centroids[i])
+        key=lambda i: weighted_performance_score(
+            centroids[i]
+        )
     )
 
     return {
         ranked[0]: "struggling",
         ranked[1]: "average",
-        ranked[2]: "outstanding"
+        ranked[2]: "outstanding",
     }
 
 
 def update_centroid(model, cluster, vector):
-
     count = int(
         model["counts"][cluster]
     )
 
     old = model["centroids"][cluster]
-
     new_count = count + 1
 
-    # Incremental / online K-Means update
     model["centroids"][cluster] = [
         old_value
-        + (
-            new_value - old_value
-        ) / new_count
+        + ((new_value - old_value) / new_count)
 
         for old_value, new_value
         in zip(old, vector)
     ]
 
     model["counts"][cluster] = new_count
-
-    model["updates"] = (
-        int(model.get("updates", 0))
-        + 1
-    )
+    model["updates"] = int(
+        model.get("updates", 0)
+    ) + 1
 
     return model
 
@@ -170,7 +215,6 @@ def update_centroid(model, cluster, vector):
 class Default(WorkerEntrypoint):
 
     def cors_headers(self):
-
         return {
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods":
@@ -178,7 +222,7 @@ class Default(WorkerEntrypoint):
             "Access-Control-Allow-Headers":
                 "Content-Type",
             "Content-Type":
-                "application/json"
+                "application/json",
         }
 
 
@@ -187,7 +231,6 @@ class Default(WorkerEntrypoint):
         payload,
         status=200
     ):
-
         return Response(
             json.dumps(payload),
             status=status,
@@ -196,15 +239,11 @@ class Default(WorkerEntrypoint):
 
 
     async def load_model(self):
-
         raw = await self.env.ML_MODEL.get(
             MODEL_KEY
         )
 
-        # First ever request:
-        # create initial model in Cloudflare KV.
         if raw is None:
-
             model = json.loads(
                 json.dumps(DEFAULT_MODEL)
             )
@@ -216,15 +255,12 @@ class Default(WorkerEntrypoint):
 
             return model
 
-
         try:
-
             return json.loads(
                 str(raw)
             )
 
         except Exception:
-
             model = json.loads(
                 json.dumps(DEFAULT_MODEL)
             )
@@ -241,7 +277,6 @@ class Default(WorkerEntrypoint):
         self,
         model
     ):
-
         await self.env.ML_MODEL.put(
             MODEL_KEY,
             json.dumps(model)
@@ -252,19 +287,14 @@ class Default(WorkerEntrypoint):
         self,
         request
     ):
-
         headers = self.cors_headers()
 
-
-        # Browser CORS preflight
         if request.method == "OPTIONS":
-
             return Response(
                 "",
                 status=204,
                 headers=headers
             )
-
 
         path = (
             urlparse(request.url)
@@ -273,49 +303,38 @@ class Default(WorkerEntrypoint):
             or "/"
         )
 
-
         # -----------------------------------------
         # GET /
-        #
-        # Check whether the ML service is running.
         # -----------------------------------------
         if (
             request.method == "GET"
             and path == "/"
         ):
-
             model = await self.load_model()
 
             return self.json_response({
                 "status": "online",
                 "service": "PIA ML API",
                 "model":
-                    "online-kmeans-3-profile",
-
+                    "weighted-online-kmeans-3-profile-v2",
                 "profiles": [
                     "struggling",
                     "average",
-                    "outstanding"
+                    "outstanding",
                 ],
-
+                "speed_rule":
+                    "speed only rewards correct responses",
                 "model_updates":
-                    model.get(
-                        "updates",
-                        0
-                    )
+                    model.get("updates", 0),
             })
-
 
         # -----------------------------------------
         # GET /model
-        #
-        # Allows us to inspect the learned clusters.
         # -----------------------------------------
         if (
             request.method == "GET"
             and path == "/model"
         ):
-
             model = await self.load_model()
 
             mapping = profile_map(
@@ -323,54 +342,47 @@ class Default(WorkerEntrypoint):
             )
 
             return self.json_response({
-
                 "model":
-                    "online-kmeans-3-profile",
-
+                    "weighted-online-kmeans-3-profile-v2",
                 "updates":
-                    model.get(
-                        "updates",
-                        0
-                    ),
-
+                    model.get("updates", 0),
                 "counts":
                     model["counts"],
-
+                "feature_weights":
+                    dict(zip(
+                        FEATURES,
+                        FEATURE_WEIGHTS
+                    )),
                 "clusters": [
-
                     {
                         "cluster": i,
-
                         "profile":
                             mapping[i],
-
+                        "performance_score":
+                            round(
+                                weighted_performance_score(
+                                    model["centroids"][i]
+                                ),
+                                4
+                            ),
                         "centroid":
-                            model[
-                                "centroids"
-                            ][i]
+                            model["centroids"][i],
                     }
-
                     for i in range(3)
-                ]
+                ],
             })
-
 
         # -----------------------------------------
         # POST /predict
-        #
-        # Student performance goes here.
         # -----------------------------------------
         if (
             request.method == "POST"
             and path == "/predict"
         ):
-
             try:
-
                 data = await request.json()
 
             except Exception:
-
                 return self.json_response(
                     {
                         "error":
@@ -379,9 +391,7 @@ class Default(WorkerEntrypoint):
                     status=400
                 )
 
-
             if not isinstance(data, dict):
-
                 return self.json_response(
                     {
                         "error":
@@ -390,13 +400,11 @@ class Default(WorkerEntrypoint):
                     status=400
                 )
 
-
             vector = feature_vector(
                 data
             )
 
             model = await self.load_model()
-
 
             cluster, distances, confidence = (
                 nearest_cluster(
@@ -405,38 +413,23 @@ class Default(WorkerEntrypoint):
                 )
             )
 
-
             mapping = profile_map(
                 model["centroids"]
             )
-
 
             profile = mapping[
                 cluster
             ]
 
-
-            # Default behavior:
-            #
-            # every meaningful student-performance
-            # snapshot helps update the model.
-            #
-            # Send:
-            #
-            # "learn": false
-            #
-            # if you only want prediction.
             should_learn = (
                 data.get(
                     "learn",
-                    True
+                    False
                 )
-                is not False
+                is True
             )
 
-
             if should_learn:
-
                 model = update_centroid(
                     model,
                     cluster,
@@ -447,9 +440,7 @@ class Default(WorkerEntrypoint):
                     model
                 )
 
-
             return self.json_response({
-
                 "profile":
                     profile,
 
@@ -471,14 +462,20 @@ class Default(WorkerEntrypoint):
                         0
                     ),
 
-                "normalized_features": {
+                "performance_score":
+                    round(
+                        weighted_performance_score(
+                            vector
+                        ),
+                        4
+                    ),
 
+                "normalized_features": {
                     FEATURES[i]:
                         round(
                             vector[i],
                             4
                         )
-
                     for i
                     in range(
                         len(FEATURES)
@@ -492,9 +489,8 @@ class Default(WorkerEntrypoint):
                     )
                     for value
                     in distances
-                ]
+                ],
             })
-
 
         return self.json_response(
             {
