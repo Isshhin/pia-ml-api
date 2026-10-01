@@ -1,9 +1,14 @@
-
 {
   "name": "pia-ml-api",
   "main": "src/entry.py",
   "compatibility_date": "2026-10-01",
   "compatibility_flags": [
     "python_workers"
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "ML_MODEL",
+      "id": "3300df5dede24b40acfb89806dad7954"
+    }
   ]
 }
